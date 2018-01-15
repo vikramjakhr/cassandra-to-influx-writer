@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"os"
 	"os/signal"
+	"strings"
+	"flag"
 )
 
 type Session struct {
@@ -25,28 +27,36 @@ type Session struct {
 
 func main() {
 	log.Println("Started cassandra to influx writer")
+	handleOSSignals()
+	log.Println("Parsing command line arguments. Example: -nodes=1.0.4.95,1.0.4.96 ")
+	nodes := flag.String("nodes", "", "cassandra cluster nodes address")
+	flag.Parse()
+	log.Println("Validating command line arguments.")
+	n := strings.Trim(*nodes, " ")
+	if n == "" {
+		log.Printf("Nodes value cannot be null or empty. Found %s", n)
+		log.Fatal("Exiting now.")
+	}
 
-	// handle os signals
-	signals := make(chan os.Signal)
-	signal.Notify(signals, os.Interrupt)
-	go func() {
-		<-signals
-		log.Println("OS Interrupt. Shutting down cassandra to influx writer.")
-		os.Exit(0)
-	}()
+	addresses := strings.Split(n, ",")
+	log.Printf("Cluster nodes after split: %s", addresses)
 
 	// connect to the cassandra cluster
-	cluster := gocql.NewCluster("1.0.4.95")
-	cluster.Timeout = 6000 * time.Millisecond
-	cluster.ConnectTimeout = 6000 * time.Millisecond
+	log.Printf("Connecting to cassandra cluster with %s", addresses)
+	cluster := gocql.NewCluster(addresses...)
+	cluster.Timeout = 60000 * time.Millisecond
+	cluster.ConnectTimeout = 60000 * time.Millisecond
 	cluster.Keyspace = "system_traces"
 	cluster.Consistency = gocql.Quorum
 	session, err := cluster.CreateSession()
 	if err != nil {
-		fmt.Println("Error")
+		log.Println("Error while creating cassandra session.")
 		log.Fatal(err)
 	}
+	log.Println("Connected to cassandra cluster.")
 	defer session.Close()
+
+	influxDB := "Connecto_cassandra"
 
 	// create influx client
 	c, err := client.NewHTTPClient(client.HTTPConfig{
@@ -59,16 +69,37 @@ func main() {
 
 	ticker := time.NewTicker(time.Minute * 5)
 
-	//go func() {
 	for t := range ticker.C {
-		log.Printf("Writing cassandra point after interval %s", t)
+		log.Printf("Runing ticker after interval %s", t)
+		var last string
+		res, err := queryInfluxDB(c, influxDB, fmt.Sprintf("select last(%s) from sessions;", "started_at"))
+		if err != nil {
+			log.Printf("Error while fetching last record from influxdb");
+			log.Println(err)
+			continue
+		} else {
+			log.Printf("Influx last record: %s", res)
+			if len(res) > 0 && len(res[0].Series) > 0 && len(res[0].Series[0].Values) > 0 {
+				log.Printf("Influx last record: %s", res[0])
+				tym := res[0].Series[0].Values[0][0]
+				val := tym.(string)
+				val, ok := tym.(string)
+				if ok {
+					last = val
+				} else {
+					log.Println("Error while parsing last record time from influx")
+					log.Fatal(err)
+				}
+			}
+		}
+		log.Printf("Writing cassandra point after %s", last)
 		// Create a new point batch
 		bp, err := client.NewBatchPoints(client.BatchPointsConfig{
-			Database: "cassandra_system_traces",
+			Database: influxDB,
 		})
 
 		if err != nil {
-			log.Println("Error while batch point")
+			log.Println("Error while creating new influx batch point")
 			log.Fatal(err)
 		}
 
@@ -81,8 +112,16 @@ func main() {
 		fields := make(map[string]interface{})
 		var count int
 
+		csQuery := fmt.Sprintf("SELECT session_id,client,command,coordinator,parameters,duration,request,started_at "+
+			"FROM sessions where started_at > '%s' ALLOW FILTERING", last)
+
+		log.Printf("Executing cassandra Query: %s", csQuery)
+
 		// list all sessions
-		iter := session.Query(`SELECT session_id,client,command,coordinator,parameters,duration,request,started_at FROM sessions`).Iter()
+		iter := session.
+		Query(csQuery).
+			PageSize(100000).
+			Iter()
 		for iter.Scan(&session_id, &clnt, &command, &coordinator, &parameters, &duration, &request, &started_at) {
 			tags["session_id"] = session_id
 			tags["client"] = clnt
@@ -90,20 +129,29 @@ func main() {
 			tags["coordinator"] = coordinator
 			fields["duration"] = duration
 			param, _ := json.Marshal(parameters)
-			fields["parameters"] = string(param)
+			s := string(param)
+			fields["parameters"] = s
 			fields["request"] = request
+			fields["started_at"] = started_at
 
-			// Create a new point
-			pt, err := client.NewPoint("sessions", tags, fields, started_at)
+			if strings.Contains(s, "SELECT") {
+				tags["type"] = "SELECT"
+			} else if strings.Contains(s, "INSERT") {
+				tags["type"] = "INSERT"
+			} else if strings.Contains(s, "UPDATE") {
+				tags["type"] = "UPDATE"
+			} else {
+				continue
+			}
+
+			pt, err := client.NewPoint("system_traces_sessions", tags, fields, started_at)
 			if err != nil {
-				log.Println("Error while new point")
-				log.Fatal(err)
+				log.Println("Error while creating new influx batch point.")
 			}
 			if count == 1000 {
 				// Write the batch
 				if err := c.Write(bp); err != nil {
-					log.Println("Error while write")
-					log.Fatal(err)
+					log.Println("Error while writing new influx batch.")
 				}
 				count = 0
 			} else {
@@ -115,15 +163,41 @@ func main() {
 		if count > 0 {
 			// Write the batch
 			if err := c.Write(bp); err != nil {
-				log.Println("Error while write")
-				log.Fatal(err)
+				log.Println("Error while writing new influx batch.")
 			}
 		}
 		if err := iter.Close(); err != nil {
-			log.Println("Error while closing iter")
+			log.Println("Error while closing cassandra iterator")
+			session.Close()
 			log.Fatal(err)
 		}
 	}
-
 	log.Println("Shutting down cassandra to influx writer")
+}
+
+func queryInfluxDB(clnt client.Client, db, cmd string) (res []client.Result, err error) {
+	log.Println("Querying influx")
+	q := client.Query{
+		Command:  cmd,
+		Database: db,
+	}
+	if response, err := clnt.Query(q); err == nil {
+		if response.Error() != nil {
+			return res, response.Error()
+		}
+		res = response.Results
+	} else {
+		return res, err
+	}
+	return res, nil
+}
+
+func handleOSSignals() {
+	signals := make(chan os.Signal)
+	signal.Notify(signals, os.Interrupt)
+	go func() {
+		<-signals
+		log.Println("OS Interrupt. Shutting down cassandra to influx writer.")
+		os.Exit(0)
+	}()
 }
