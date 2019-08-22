@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 
 	"github.com/gocql/gocql"
@@ -71,7 +70,7 @@ func main() {
 
 	for t := range ticker.C {
 		log.Printf("Runing ticker after interval %s", t)
-		var last string
+		/*var last string
 		res, err := queryInfluxDB(c, influxDB, fmt.Sprintf("select last(%s) from sessions;", "started_at"))
 		if err != nil {
 			log.Printf("Error while fetching last record from influxdb");
@@ -92,7 +91,7 @@ func main() {
 				}
 			}
 		}
-		log.Printf("Writing cassandra point after %s", last)
+		log.Printf("Writing cassandra point after %s", last)*/
 		// Create a new point batch
 		bp, err := client.NewBatchPoints(client.BatchPointsConfig{
 			Database: influxDB,
@@ -112,8 +111,10 @@ func main() {
 		fields := make(map[string]interface{})
 		var count int
 
-		csQuery := fmt.Sprintf("SELECT session_id,client,command,coordinator,parameters,duration,request,started_at "+
-			"FROM sessions where started_at > '%s' ALLOW FILTERING", last)
+		/*csQuery := fmt.Sprintf("SELECT session_id,client,command,coordinator,parameters,duration,request,started_at "+
+			"FROM sessions where started_at > '%s' ALLOW FILTERING", last)*/
+
+		csQuery := "SELECT session_id,client,command,coordinator,parameters,duration,request,started_at FROM sessions"
 
 		log.Printf("Executing cassandra Query: %s", csQuery)
 
@@ -128,6 +129,7 @@ func main() {
 			tags["command"] = command
 			tags["coordinator"] = coordinator
 			fields["duration"] = duration
+			fields["session_id"] = session_id
 			param, _ := json.Marshal(parameters)
 			s := string(param)
 			fields["parameters"] = s
@@ -170,6 +172,8 @@ func main() {
 			log.Println("Error while closing cassandra iterator")
 			session.Close()
 			log.Fatal(err)
+		} else {
+			session.Query("TRUNCATE sessions").Exec()
 		}
 	}
 	log.Println("Shutting down cassandra to influx writer")
